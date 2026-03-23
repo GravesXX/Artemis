@@ -1,0 +1,13 @@
+{
+  "id": "artemis",
+  "name": "Artemis - The Huntress",
+  "version": "0.1.0",
+  "description": "Automated job discovery, confidence scoring, daily reporting, and application submission with browser automation",
+  "entry": "./index.ts",
+  "skills": ["./skills"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "artemis-plugin",
+  "version": "0.1.0",
+  "description": "Artemis job hunting agent plugin",
+  "main": "index.js",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "tsc"
+  },
+  "type": "commonjs",
+  "openclaw": {
+    "extensions": ["./src/index.ts"]
+  },
+  "dependencies": {
+    "obsidian-adapter": "file:../../obsidian-adapter",
+    "gray-matter": "^4.0.3",
+    "uuid": "^13.0.0",
+    "playwright": "^1.50.0",
+    "marked": "^15.0.0",
+    "imapflow": "^1.0.170"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  }
+}
