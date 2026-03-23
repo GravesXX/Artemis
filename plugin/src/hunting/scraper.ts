@@ -12,7 +12,7 @@ export interface ScrapeResult {
   errors: string[];
 }
 
-type Platform = 'greenhouse' | 'lever' | 'workday' | 'ashby' | 'apple' | 'microsoft' | 'google' | 'generic';
+type Platform = 'greenhouse' | 'lever' | 'workday' | 'ashby' | 'apple' | 'microsoft' | 'google' | 'ibm' | 'generic';
 
 // ── CareerPageScraper ───────────────────────────────────────────────────────
 
@@ -107,6 +107,8 @@ export class CareerPageScraper {
           return this.scrapeMicrosoft(page, companyId, careersUrl);
         case 'google':
           return this.scrapeGoogle(page, companyId, careersUrl);
+        case 'ibm':
+          return this.scrapeIbm(page, companyId, careersUrl);
         default:
           jobLinks = await this.discoverGeneric(page, careersUrl);
       }
@@ -147,8 +149,9 @@ export class CareerPageScraper {
     if (lower.includes('myworkdayjobs.com') || lower.includes('.wd5.') || lower.includes('.wd1.')) return 'workday';
     if (lower.includes('jobs.ashbyhq.com')) return 'ashby';
     if (lower.includes('jobs.apple.com')) return 'apple';
-    if (lower.includes('careers.microsoft.com')) return 'microsoft';
+    if (lower.includes('careers.microsoft.com') || lower.includes('jobs.careers.microsoft.com')) return 'microsoft';
     if (lower.includes('careers.google.com') || lower.includes('google.com/about/careers')) return 'google';
+    if (lower.includes('ibm.com/careers')) return 'ibm' as Platform;
     return 'generic';
   }
 
@@ -376,34 +379,67 @@ export class CareerPageScraper {
     const result: ScrapeResult = { companyId, careersUrl, jobs: [], errors: [] };
 
     try {
-      // Apple's search page renders results via JavaScript
-      // Navigate with search params for software engineer in Canada
       const searchUrl = careersUrl.includes('searchString')
         ? careersUrl
         : `${careersUrl}?searchString=software+engineer`;
 
       await page.goto(searchUrl, { waitUntil: 'networkidle' });
-      await page.waitForTimeout(3000);
+      await page.waitForTimeout(5000);
 
-      // Apple renders job cards with links to /en-us/details/{id}
-      const jobs = await page.$$eval('a[href*="/details/"]', (anchors: HTMLAnchorElement[]) => {
-        return anchors.map(a => {
-          const title = a.querySelector('h3, .title, [class*="title"]')?.textContent?.trim()
-            || a.textContent?.trim().split('\n')[0]?.trim() || '';
-          const location = a.querySelector('.location, [class*="location"]')?.textContent?.trim() || '';
-          return { href: a.href, title, location };
-        }).filter(j => j.title && j.href);
+      // Apple's React SPA renders search results into the DOM.
+      // Extract job data from the rendered table/list elements.
+      const jobs = await page.evaluate(() => {
+        const results: Array<{ title: string; url: string; location: string }> = [];
+
+        // Apple renders job results as table rows or list items with links to /details/{id}
+        document.querySelectorAll('a').forEach(a => {
+          const href = a.getAttribute('href') ?? '';
+          if (!href.includes('/details/') && !href.includes('/search/')) return;
+          if (href.includes('/details/')) {
+            // Find the closest parent that contains title and location info
+            const row = a.closest('tr, li, [class*="result"], [class*="card"], [class*="row"]') ?? a;
+            const texts = (row.textContent ?? '').split('\n').map(t => t.trim()).filter(t => t.length > 3);
+            if (texts.length > 0) {
+              results.push({
+                title: texts[0],
+                url: href.startsWith('http') ? href : `https://jobs.apple.com${href}`,
+                location: texts.find(t => t.includes(',') || t.toLowerCase().includes('remote') || t.toLowerCase().includes('canada')) ?? '',
+              });
+            }
+          }
+        });
+
+        // Fallback: look for structured data or __NEXT_DATA__
+        if (results.length === 0) {
+          const scripts = document.querySelectorAll('script');
+          for (const script of scripts) {
+            const text = script.textContent ?? '';
+            if (text.includes('searchResults') || text.includes('postingTitle')) {
+              try {
+                // Try to find job objects in embedded JSON
+                const matches = text.matchAll(/"postingTitle"\s*:\s*"([^"]+)"/g);
+                for (const match of matches) {
+                  results.push({ title: match[1], url: '', location: '' });
+                }
+              } catch {}
+            }
+          }
+        }
+
+        return results;
       });
 
       for (const job of jobs.slice(0, 30)) {
-        result.jobs.push({
-          url: job.href,
-          title: job.title,
-          rawText: `${job.title}. Location: ${job.location}`,
-          salary: null,
-          location: job.location || null,
-          level: this.detectLevelFromTitle(job.title),
-        });
+        if (job.title) {
+          result.jobs.push({
+            url: job.url || `https://jobs.apple.com/en-us/search?searchString=${encodeURIComponent(job.title)}`,
+            title: job.title,
+            rawText: `${job.title}. Location: ${job.location}`,
+            salary: null,
+            location: job.location || null,
+            level: this.detectLevelFromTitle(job.title),
+          });
+        }
       }
     } catch (err) {
       result.errors.push(`Apple scrape error: ${err instanceof Error ? err.message : String(err)}`);
@@ -416,30 +452,59 @@ export class CareerPageScraper {
     const result: ScrapeResult = { companyId, careersUrl, jobs: [], errors: [] };
 
     try {
-      // Microsoft careers: search with Canada filter
-      const searchUrl = `https://careers.microsoft.com/us/en/search-results?keywords=software%20engineer&country=Canada`;
+      // Microsoft's career page uses Phenom People SPA. Use the jobs.careers.microsoft.com domain instead.
+      const searchUrl = 'https://jobs.careers.microsoft.com/global/en/search?q=software%20engineer&lc=Canada&l=en_us&pg=1&pgSz=20&o=Relevance&flt=true';
       await page.goto(searchUrl, { waitUntil: 'networkidle' });
-      await page.waitForTimeout(5000);
+      await page.waitForTimeout(8000);
 
-      // Microsoft renders job cards in a list
-      const jobs = await page.$$eval('[data-ph-at-id="jobs-list"] a, .jobs-list-item a, a[href*="/job/"]', (anchors: HTMLAnchorElement[]) => {
-        return anchors.map(a => {
-          const title = a.querySelector('h2, h3, .job-title, [class*="title"]')?.textContent?.trim()
-            || a.textContent?.trim().split('\n')[0]?.trim() || '';
-          const location = a.querySelector('.job-location, [class*="location"]')?.textContent?.trim() || '';
-          return { href: a.href, title, location };
-        }).filter(j => j.title && j.title.length > 5 && j.href.includes('/job/'));
+      // Extract job cards from the rendered page
+      const jobs = await page.evaluate(() => {
+        const results: Array<{ title: string; url: string; location: string }> = [];
+
+        // Microsoft renders job cards with various possible selectors
+        const cards = document.querySelectorAll('[class*="job-card"], [class*="JobCard"], [data-ph-at-id], li[class*="jobs"]');
+        for (const card of cards) {
+          const linkEl = card.querySelector('a[href*="/job/"]') as HTMLAnchorElement | null;
+          const titleEl = card.querySelector('h2, h3, [class*="title"]');
+          const locEl = card.querySelector('[class*="location"], [class*="Location"]');
+
+          if (titleEl) {
+            results.push({
+              title: titleEl.textContent?.trim() ?? '',
+              url: linkEl?.href ?? '',
+              location: locEl?.textContent?.trim() ?? '',
+            });
+          }
+        }
+
+        // Fallback: any link with /job/ in href
+        if (results.length === 0) {
+          document.querySelectorAll('a[href*="/job/"]').forEach(a => {
+            const text = (a.textContent ?? '').trim();
+            if (text.length > 5 && text.length < 200) {
+              results.push({
+                title: text.split('\n')[0].trim(),
+                url: (a as HTMLAnchorElement).href,
+                location: '',
+              });
+            }
+          });
+        }
+
+        return results;
       });
 
       for (const job of jobs.slice(0, 30)) {
-        result.jobs.push({
-          url: job.href,
-          title: job.title,
-          rawText: `${job.title}. Location: ${job.location}`,
-          salary: null,
-          location: job.location || null,
-          level: this.detectLevelFromTitle(job.title),
-        });
+        if (job.title) {
+          result.jobs.push({
+            url: job.url || `https://jobs.careers.microsoft.com/global/en/search?q=${encodeURIComponent(job.title)}`,
+            title: job.title,
+            rawText: `${job.title}. Location: ${job.location}`,
+            salary: null,
+            location: job.location || null,
+            level: this.detectLevelFromTitle(job.title),
+          });
+        }
       }
     } catch (err) {
       result.errors.push(`Microsoft scrape error: ${err instanceof Error ? err.message : String(err)}`);
@@ -452,45 +517,165 @@ export class CareerPageScraper {
     const result: ScrapeResult = { companyId, careersUrl, jobs: [], errors: [] };
 
     try {
-      // Google careers: search for software engineer in Canada
       const searchUrl = 'https://www.google.com/about/careers/applications/jobs/results?q=software%20engineer&location=Canada';
       await page.goto(searchUrl, { waitUntil: 'networkidle' });
-      await page.waitForTimeout(3000);
+      await page.waitForTimeout(5000);
 
-      // Google renders job cards as list items with links
-      const jobs = await page.$$eval('a[href*="/jobs/results/"]', (anchors: HTMLAnchorElement[]) => {
-        return anchors.map(a => {
-          const title = a.querySelector('h3, [class*="title"]')?.textContent?.trim()
-            || a.textContent?.trim().split('\n')[0]?.trim() || '';
-          const location = a.querySelector('[class*="location"]')?.textContent?.trim() || '';
-          return { href: a.href, title, location };
-        }).filter(j => j.title && j.title.length > 5);
+      // Google embeds job data in the server-rendered HTML via AF_initDataCallback.
+      // The page body is 1.2MB with embedded job data. Extract from the DOM.
+      const jobs = await page.evaluate(() => {
+        const results: Array<{ title: string; url: string; location: string }> = [];
+
+        // Google renders job listings as clickable elements with role/title info
+        // Look for elements that contain job titles (typically h3 or specific class names)
+        const allElements = document.querySelectorAll('h3, [class*="card"] h3, li h3');
+        for (const el of allElements) {
+          const text = el.textContent?.trim() ?? '';
+          // Filter for actual job titles (not navigation items)
+          if (text.length > 10 && text.length < 150 &&
+              (text.toLowerCase().includes('engineer') || text.toLowerCase().includes('developer') ||
+               text.toLowerCase().includes('software') || text.toLowerCase().includes('sre'))) {
+            // Find the closest link
+            const parent = el.closest('a, [role="link"], li') as HTMLElement | null;
+            const link = parent?.querySelector('a') as HTMLAnchorElement | null;
+            const href = link?.href ?? parent?.getAttribute('data-href') ?? '';
+
+            // Find location text near the title
+            const container = el.closest('li, [class*="card"], [class*="result"]') ?? el.parentElement;
+            const locationEl = container?.querySelector('[class*="location"], span + span');
+            const location = locationEl?.textContent?.trim() ?? '';
+
+            results.push({ title: text, url: href, location });
+          }
+        }
+
+        // Fallback: extract from the page source via embedded data
+        if (results.length === 0) {
+          const html = document.documentElement.innerHTML;
+          // Google's AF_initDataCallback contains job data as nested arrays
+          // The analytics already showed jobs exist — try to extract from text content
+          const bodyText = document.body.textContent ?? '';
+          const jobPattern = /((?:Senior |Junior |Staff |Lead )?(?:Software|Backend|Frontend|Full.?Stack|Platform|Infrastructure|Systems|Site Reliability|DevOps)[\s\w,/]*(?:Engineer|Developer|SWE|SDE)[\w\s,]*)/g;
+          let match;
+          const seen = new Set();
+          while ((match = jobPattern.exec(bodyText)) !== null) {
+            const title = match[1].trim();
+            if (title.length > 10 && title.length < 120 && !seen.has(title)) {
+              seen.add(title);
+              results.push({ title, url: '', location: 'Canada' });
+            }
+          }
+        }
+
+        return results;
       });
 
-      // Also try the newer Google Careers UI
-      if (jobs.length === 0) {
-        const altJobs = await page.$$eval('li[class*="job"] a, [data-job-id] a, .gc-card a', (anchors: HTMLAnchorElement[]) => {
-          return anchors.map(a => ({
-            href: a.href,
-            title: a.textContent?.trim().split('\n')[0]?.trim() || '',
-            location: '',
-          })).filter(j => j.title && j.title.length > 5);
-        });
-        jobs.push(...altJobs);
-      }
-
       for (const job of jobs.slice(0, 30)) {
-        result.jobs.push({
-          url: job.href,
-          title: job.title,
-          rawText: `${job.title}. Location: ${job.location || 'Canada'}`,
-          salary: null,
-          location: job.location || 'Canada',
-          level: this.detectLevelFromTitle(job.title),
-        });
+        if (job.title) {
+          result.jobs.push({
+            url: job.url || `https://www.google.com/about/careers/applications/jobs/results?q=${encodeURIComponent(job.title)}&location=Canada`,
+            title: job.title,
+            rawText: `${job.title}. Location: ${job.location || 'Canada'}`,
+            salary: null,
+            location: job.location || 'Canada',
+            level: this.detectLevelFromTitle(job.title),
+          });
+        }
       }
     } catch (err) {
       result.errors.push(`Google scrape error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    return result;
+  }
+
+  private async scrapeIbm(page: Page, companyId: string, careersUrl: string): Promise<ScrapeResult> {
+    const result: ScrapeResult = { companyId, careersUrl, jobs: [], errors: [] };
+
+    try {
+      const searchUrl = 'https://www.ibm.com/careers/search?field_keyword_18[0]=Software%20Engineering&field_keyword_05[0]=Canada';
+      await page.goto(searchUrl, { waitUntil: 'networkidle' });
+      await page.waitForTimeout(8000);
+
+      // IBM's search component makes a POST to www-api.ibm.com/search/api/v2
+      // We intercept the response by making the call from the page context (with its cookies)
+      const jobs = await page.evaluate(async () => {
+        const results: Array<{ title: string; url: string; location: string }> = [];
+
+        try {
+          const response = await fetch('https://www-api.ibm.com/search/api/v2', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({
+              lang: 'en',
+              query: 'Software Engineer',
+              filters: {
+                field_keyword_05: ['Canada'],
+                field_keyword_18: ['Software Engineering'],
+              },
+              limit: 30,
+              offset: 0,
+            }),
+          });
+
+          if (response.ok) {
+            const data = await response.json();
+            const hits = (data as any)?.results ?? (data as any)?.hits ?? [];
+            for (const hit of hits) {
+              results.push({
+                title: hit.title ?? hit.name ?? '',
+                url: hit.url ?? hit.link ?? '',
+                location: hit.location ?? hit.field_keyword_05?.[0] ?? '',
+              });
+            }
+          }
+        } catch {}
+
+        // Fallback: extract from the rendered DOM
+        if (results.length === 0) {
+          const cards = document.querySelectorAll('[class*="job-card"], [class*="search-result"], [class*="bx--card"], a[href*="/job/"]');
+          for (const card of cards) {
+            const titleEl = card.querySelector('h3, h4, [class*="title"]');
+            const linkEl = card.querySelector('a[href*="/job/"]') as HTMLAnchorElement | null;
+            const locEl = card.querySelector('[class*="location"]');
+            if (titleEl) {
+              results.push({
+                title: titleEl.textContent?.trim() ?? '',
+                url: linkEl?.href ?? '',
+                location: locEl?.textContent?.trim() ?? '',
+              });
+            }
+          }
+        }
+
+        // Last fallback: scan all links for job-like patterns
+        if (results.length === 0) {
+          document.querySelectorAll('a[href]').forEach(a => {
+            const href = (a as HTMLAnchorElement).href;
+            const text = (a.textContent ?? '').trim();
+            if ((href.includes('/job/') || href.includes('/position/')) && text.length > 10 && text.length < 150) {
+              results.push({ title: text.split('\n')[0].trim(), url: href, location: 'Canada' });
+            }
+          });
+        }
+
+        return results;
+      });
+
+      for (const job of jobs.slice(0, 30)) {
+        if (job.title) {
+          result.jobs.push({
+            url: job.url || `https://www.ibm.com/careers/search?q=${encodeURIComponent(job.title)}`,
+            title: job.title,
+            rawText: `${job.title}. Location: ${job.location || 'Canada'}`,
+            salary: null,
+            location: job.location || null,
+            level: this.detectLevelFromTitle(job.title),
+          });
+        }
+      }
+    } catch (err) {
+      result.errors.push(`IBM scrape error: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     return result;
