@@ -81,11 +81,32 @@ export class CareerPageScraper {
     page.setDefaultTimeout(30000);
 
     try {
-      // Phase 1: Discovery
+      const platform = this.detectPlatform(careersUrl);
+
+      // Company-specific scrapers need a fresh page (no prior navigation)
+      if (['apple', 'microsoft', 'google', 'ibm'].includes(platform)) {
+        const freshPage = await context.newPage();
+        freshPage.setDefaultTimeout(30000);
+        try {
+          switch (platform) {
+            case 'apple':
+              return await this.scrapeApple(freshPage, companyId, careersUrl);
+            case 'microsoft':
+              return await this.scrapeMicrosoft(freshPage, companyId, careersUrl);
+            case 'google':
+              return await this.scrapeGoogle(freshPage, companyId, careersUrl);
+            case 'ibm':
+              return await this.scrapeIbm(freshPage, companyId, careersUrl);
+          }
+        } finally {
+          await freshPage.close();
+        }
+      }
+
+      // Standard platforms: navigate first, then discover links
       await page.goto(careersUrl, { waitUntil: 'domcontentloaded' });
       await this.waitAndSettle(page);
 
-      const platform = this.detectPlatform(careersUrl);
       let jobLinks: string[];
 
       switch (platform) {
@@ -101,14 +122,6 @@ export class CareerPageScraper {
         case 'workday':
           jobLinks = await this.discoverWorkday(page);
           break;
-        case 'apple':
-          return this.scrapeApple(page, companyId, careersUrl);
-        case 'microsoft':
-          return this.scrapeMicrosoft(page, companyId, careersUrl);
-        case 'google':
-          return this.scrapeGoogle(page, companyId, careersUrl);
-        case 'ibm':
-          return this.scrapeIbm(page, companyId, careersUrl);
         default:
           jobLinks = await this.discoverGeneric(page, careersUrl);
       }
@@ -379,67 +392,46 @@ export class CareerPageScraper {
     const result: ScrapeResult = { companyId, careersUrl, jobs: [], errors: [] };
 
     try {
-      const searchUrl = careersUrl.includes('searchString')
-        ? careersUrl
-        : `${careersUrl}?searchString=software+engineer`;
+      // Search for "software engineer canada" — the location URL param doesn't work
+      await page.goto('https://jobs.apple.com/en-us/search?searchString=software+engineer+canada', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+      await page.waitForTimeout(8000);  // Apple's React app needs extra time to render results
 
-      await page.goto(searchUrl, { waitUntil: 'networkidle' });
-      await page.waitForTimeout(5000);
-
-      // Apple's React SPA renders search results into the DOM.
-      // Extract job data from the rendered table/list elements.
+      // Apple renders job cards as links with title text + location in sibling elements
       const jobs = await page.evaluate(() => {
-        const results: Array<{ title: string; url: string; location: string }> = [];
+        const results: Array<{ title: string; url: string; location: string; team: string }> = [];
 
-        // Apple renders job results as table rows or list items with links to /details/{id}
-        document.querySelectorAll('a').forEach(a => {
-          const href = a.getAttribute('href') ?? '';
-          if (!href.includes('/details/') && !href.includes('/search/')) return;
-          if (href.includes('/details/')) {
-            // Find the closest parent that contains title and location info
-            const row = a.closest('tr, li, [class*="result"], [class*="card"], [class*="row"]') ?? a;
-            const texts = (row.textContent ?? '').split('\n').map(t => t.trim()).filter(t => t.length > 3);
-            if (texts.length > 0) {
-              results.push({
-                title: texts[0],
-                url: href.startsWith('http') ? href : `https://jobs.apple.com${href}`,
-                location: texts.find(t => t.includes(',') || t.toLowerCase().includes('remote') || t.toLowerCase().includes('canada')) ?? '',
-              });
-            }
+        // Each result is a link (a tag) to /en-us/details/{id}/{slug}
+        document.querySelectorAll('a[href*="/details/"]').forEach(a => {
+          const href = (a as HTMLAnchorElement).href;
+          // The link's parent/container has the title and metadata
+          const container = a.closest('li, tr, [class*="result"], [class*="row"]') ?? a.parentElement ?? a;
+          const textParts = (container.textContent ?? '').split('\n').map(t => t.trim()).filter(t => t.length > 2);
+
+          // Typically: [title, team, location, date]
+          const title = textParts[0] ?? '';
+          const team = textParts[1] ?? '';
+          const location = textParts.find(t =>
+            /canada|ontario|toronto|remote|waterloo|ottawa|vancouver/i.test(t)
+          ) ?? textParts[2] ?? '';
+
+          if (title.length > 5) {
+            results.push({ title, url: href, location, team });
           }
         });
-
-        // Fallback: look for structured data or __NEXT_DATA__
-        if (results.length === 0) {
-          const scripts = document.querySelectorAll('script');
-          for (const script of scripts) {
-            const text = script.textContent ?? '';
-            if (text.includes('searchResults') || text.includes('postingTitle')) {
-              try {
-                // Try to find job objects in embedded JSON
-                const matches = text.matchAll(/"postingTitle"\s*:\s*"([^"]+)"/g);
-                for (const match of matches) {
-                  results.push({ title: match[1], url: '', location: '' });
-                }
-              } catch {}
-            }
-          }
-        }
 
         return results;
       });
 
       for (const job of jobs.slice(0, 30)) {
-        if (job.title) {
-          result.jobs.push({
-            url: job.url || `https://jobs.apple.com/en-us/search?searchString=${encodeURIComponent(job.title)}`,
-            title: job.title,
-            rawText: `${job.title}. Location: ${job.location}`,
-            salary: null,
-            location: job.location || null,
-            level: this.detectLevelFromTitle(job.title),
-          });
-        }
+        result.jobs.push({
+          url: job.url,
+          title: job.title,
+          rawText: `${job.title}. Team: ${job.team}. Location: ${job.location}`,
+          salary: null,
+          location: job.location || null,
+          level: this.detectLevelFromTitle(job.title),
+        });
       }
     } catch (err) {
       result.errors.push(`Apple scrape error: ${err instanceof Error ? err.message : String(err)}`);
@@ -452,22 +444,22 @@ export class CareerPageScraper {
     const result: ScrapeResult = { companyId, careersUrl, jobs: [], errors: [] };
 
     try {
-      // Microsoft's career page uses Phenom People SPA. Use the jobs.careers.microsoft.com domain instead.
-      const searchUrl = 'https://jobs.careers.microsoft.com/global/en/search?q=software%20engineer&lc=Canada&l=en_us&pg=1&pgSz=20&o=Relevance&flt=true';
-      await page.goto(searchUrl, { waitUntil: 'networkidle' });
-      await page.waitForTimeout(8000);
+      // Microsoft's site is slow — use domcontentloaded instead of networkidle, increase timeout
+      const searchUrl = 'https://jobs.careers.microsoft.com/global/en/search?q=software+engineer&lc=Canada&l=en_us&pg=1&pgSz=20&o=Relevance&flt=true';
+      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      // Wait for the SPA to render job cards
+      await page.waitForSelector('[class*="ms-List-cell"], [class*="job"], a[href*="/job/"]', { timeout: 30000 }).catch(() => {});
+      await page.waitForTimeout(5000);
 
-      // Extract job cards from the rendered page
       const jobs = await page.evaluate(() => {
         const results: Array<{ title: string; url: string; location: string }> = [];
 
-        // Microsoft renders job cards with various possible selectors
-        const cards = document.querySelectorAll('[class*="job-card"], [class*="JobCard"], [data-ph-at-id], li[class*="jobs"]');
-        for (const card of cards) {
+        // Try multiple selector strategies
+        // Strategy 1: Phenom job cards
+        document.querySelectorAll('[class*="ms-List-cell"], [class*="job-card"], [class*="JobCard"]').forEach(card => {
+          const titleEl = card.querySelector('h2, h3, [class*="title"], [class*="Title"]');
           const linkEl = card.querySelector('a[href*="/job/"]') as HTMLAnchorElement | null;
-          const titleEl = card.querySelector('h2, h3, [class*="title"]');
           const locEl = card.querySelector('[class*="location"], [class*="Location"]');
-
           if (titleEl) {
             results.push({
               title: titleEl.textContent?.trim() ?? '',
@@ -475,13 +467,13 @@ export class CareerPageScraper {
               location: locEl?.textContent?.trim() ?? '',
             });
           }
-        }
+        });
 
-        // Fallback: any link with /job/ in href
+        // Strategy 2: any link with /job/ that has meaningful text
         if (results.length === 0) {
           document.querySelectorAll('a[href*="/job/"]').forEach(a => {
             const text = (a.textContent ?? '').trim();
-            if (text.length > 5 && text.length < 200) {
+            if (text.length > 10 && text.length < 200) {
               results.push({
                 title: text.split('\n')[0].trim(),
                 url: (a as HTMLAnchorElement).href,
@@ -489,6 +481,29 @@ export class CareerPageScraper {
               });
             }
           });
+        }
+
+        // Strategy 3: look for embedded JSON data
+        if (results.length === 0) {
+          const scripts = document.querySelectorAll('script');
+          for (const script of scripts) {
+            const text = script.textContent ?? '';
+            if (text.includes('"jobs"') && text.includes('"title"')) {
+              try {
+                const match = text.match(/"jobs"\s*:\s*(\[[\s\S]*?\])/);
+                if (match) {
+                  const jobs = JSON.parse(match[1]);
+                  for (const j of jobs) {
+                    results.push({
+                      title: j.title ?? '',
+                      url: j.url ?? j.applyUrl ?? '',
+                      location: j.location ?? j.primaryLocation ?? '',
+                    });
+                  }
+                }
+              } catch {}
+            }
+          }
         }
 
         return results;
@@ -518,54 +533,43 @@ export class CareerPageScraper {
 
     try {
       const searchUrl = 'https://www.google.com/about/careers/applications/jobs/results?q=software%20engineer&location=Canada';
-      await page.goto(searchUrl, { waitUntil: 'networkidle' });
+      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
       await page.waitForTimeout(5000);
 
-      // Google embeds job data in the server-rendered HTML via AF_initDataCallback.
-      // The page body is 1.2MB with embedded job data. Extract from the DOM.
+      // Google renders job cards with h3.QJPWVe for titles (confirmed via debug)
+      // Each job is in a list item with title, location, and link
       const jobs = await page.evaluate(() => {
         const results: Array<{ title: string; url: string; location: string }> = [];
 
-        // Google renders job listings as clickable elements with role/title info
-        // Look for elements that contain job titles (typically h3 or specific class names)
-        const allElements = document.querySelectorAll('h3, [class*="card"] h3, li h3');
-        for (const el of allElements) {
-          const text = el.textContent?.trim() ?? '';
-          // Filter for actual job titles (not navigation items)
-          if (text.length > 10 && text.length < 150 &&
-              (text.toLowerCase().includes('engineer') || text.toLowerCase().includes('developer') ||
-               text.toLowerCase().includes('software') || text.toLowerCase().includes('sre'))) {
-            // Find the closest link
-            const parent = el.closest('a, [role="link"], li') as HTMLElement | null;
-            const link = parent?.querySelector('a') as HTMLAnchorElement | null;
-            const href = link?.href ?? parent?.getAttribute('data-href') ?? '';
+        // Primary strategy: h3 elements with the known class
+        document.querySelectorAll('h3').forEach(h3 => {
+          const text = h3.textContent?.trim() ?? '';
+          if (text.length < 10 || text.length > 150) return;
+          // Skip navigation headers
+          if (/^(about|careers|locations|teams|students|blog|how we hire)/i.test(text)) return;
 
-            // Find location text near the title
-            const container = el.closest('li, [class*="card"], [class*="result"]') ?? el.parentElement;
-            const locationEl = container?.querySelector('[class*="location"], span + span');
-            const location = locationEl?.textContent?.trim() ?? '';
+          // Find the parent list item or card
+          const card = h3.closest('li, [role="listitem"], [class*="card"]') ?? h3.parentElement;
+          if (!card) return;
 
-            results.push({ title: text, url: href, location });
-          }
-        }
+          // Find the link — Google wraps each job card in a clickable element
+          const link = card.querySelector('a') as HTMLAnchorElement | null;
+          const href = link?.href ?? '';
 
-        // Fallback: extract from the page source via embedded data
-        if (results.length === 0) {
-          const html = document.documentElement.innerHTML;
-          // Google's AF_initDataCallback contains job data as nested arrays
-          // The analytics already showed jobs exist — try to extract from text content
-          const bodyText = document.body.textContent ?? '';
-          const jobPattern = /((?:Senior |Junior |Staff |Lead )?(?:Software|Backend|Frontend|Full.?Stack|Platform|Infrastructure|Systems|Site Reliability|DevOps)[\s\w,/]*(?:Engineer|Developer|SWE|SDE)[\w\s,]*)/g;
-          let match;
-          const seen = new Set();
-          while ((match = jobPattern.exec(bodyText)) !== null) {
-            const title = match[1].trim();
-            if (title.length > 10 && title.length < 120 && !seen.has(title)) {
-              seen.add(title);
-              results.push({ title, url: '', location: 'Canada' });
+          // Find location — typically a span after the title
+          const spans = card.querySelectorAll('span');
+          let location = '';
+          for (const span of spans) {
+            const spanText = span.textContent?.trim() ?? '';
+            if (spanText.includes(',') && spanText.length < 80 && spanText !== text) {
+              location = spanText;
+              break;
             }
           }
-        }
+
+          results.push({ title: text, url: href, location });
+        });
 
         return results;
       });
@@ -593,68 +597,66 @@ export class CareerPageScraper {
     const result: ScrapeResult = { companyId, careersUrl, jobs: [], errors: [] };
 
     try {
-      const searchUrl = 'https://www.ibm.com/careers/search?field_keyword_18[0]=Software%20Engineering&field_keyword_05[0]=Canada';
-      await page.goto(searchUrl, { waitUntil: 'networkidle' });
-      await page.waitForTimeout(8000);
+      // Set cookies to skip the locale popup
+      const context = page.context();
+      await context.addCookies([
+        { name: 'defined_locale', value: 'en', domain: '.ibm.com', path: '/' },
+        { name: 'defined_cc', value: 'CA', domain: '.ibm.com', path: '/' },
+      ]);
 
-      // IBM's search component makes a POST to www-api.ibm.com/search/api/v2
-      // We intercept the response by making the call from the page context (with its cookies)
-      const jobs = await page.evaluate(async () => {
+      const searchUrl = 'https://www.ibm.com/careers/search?field_keyword_18[0]=Software%20Engineering&field_keyword_05[0]=Canada';
+      await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(3000);
+
+      // Dismiss any remaining popups (cookie consent, locale)
+      await page.evaluate(() => {
+        document.querySelectorAll('button, a').forEach(el => {
+          const text = (el.textContent ?? '').toLowerCase().trim();
+          if (text === 'accept' || text === 'accept all' || text === 'close' || text === 'annuler' || text === 'dismiss') {
+            (el as HTMLElement).click();
+          }
+        });
+      });
+      await page.waitForTimeout(5000);
+
+      // Wait for the embedded search component to load results
+      await page.waitForSelector('[class*="search-result"], [class*="result-item"], a[href*="/job/"]', { timeout: 15000 }).catch(() => {});
+      await page.waitForTimeout(3000);
+
+      const jobs = await page.evaluate(() => {
         const results: Array<{ title: string; url: string; location: string }> = [];
 
-        try {
-          const response = await fetch('https://www-api.ibm.com/search/api/v2', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-            body: JSON.stringify({
-              lang: 'en',
-              query: 'Software Engineer',
-              filters: {
-                field_keyword_05: ['Canada'],
-                field_keyword_18: ['Software Engineering'],
-              },
-              limit: 30,
-              offset: 0,
-            }),
-          });
-
-          if (response.ok) {
-            const data = await response.json();
-            const hits = (data as any)?.results ?? (data as any)?.hits ?? [];
-            for (const hit of hits) {
-              results.push({
-                title: hit.title ?? hit.name ?? '',
-                url: hit.url ?? hit.link ?? '',
-                location: hit.location ?? hit.field_keyword_05?.[0] ?? '',
-              });
-            }
+        // IBM renders search results in its embedded search component
+        // Look for any links or cards with job-like content
+        document.querySelectorAll('a[href]').forEach(a => {
+          const href = (a as HTMLAnchorElement).href;
+          const text = (a.textContent ?? '').trim();
+          // IBM job URLs contain /job/ or have specific patterns
+          if (text.length > 10 && text.length < 150 &&
+              (href.includes('/job/') || href.includes('/position/') || href.includes('/careers/') && href !== window.location.href) &&
+              /engineer|developer|software|devops|sre|architect/i.test(text)) {
+            const container = a.closest('li, [class*="result"], [class*="card"]') ?? a.parentElement;
+            const locEl = container?.querySelector('[class*="location"]');
+            results.push({
+              title: text.split('\n')[0].trim(),
+              url: href,
+              location: locEl?.textContent?.trim() ?? '',
+            });
           }
-        } catch {}
+        });
 
-        // Fallback: extract from the rendered DOM
+        // Fallback: find any text that looks like a job title in the results area
         if (results.length === 0) {
-          const cards = document.querySelectorAll('[class*="job-card"], [class*="search-result"], [class*="bx--card"], a[href*="/job/"]');
-          for (const card of cards) {
-            const titleEl = card.querySelector('h3, h4, [class*="title"]');
-            const linkEl = card.querySelector('a[href*="/job/"]') as HTMLAnchorElement | null;
-            const locEl = card.querySelector('[class*="location"]');
-            if (titleEl) {
+          const mainContent = document.querySelector('main, [role="main"], #content, .content') ?? document.body;
+          mainContent.querySelectorAll('h3, h4, [class*="title"]').forEach(el => {
+            const text = el.textContent?.trim() ?? '';
+            if (text.length > 10 && text.length < 150 && /engineer|developer|software/i.test(text)) {
+              const link = el.closest('a') as HTMLAnchorElement | null ?? el.querySelector('a') as HTMLAnchorElement | null;
               results.push({
-                title: titleEl.textContent?.trim() ?? '',
-                url: linkEl?.href ?? '',
-                location: locEl?.textContent?.trim() ?? '',
+                title: text,
+                url: link?.href ?? '',
+                location: 'Canada',
               });
-            }
-          }
-        }
-
-        // Last fallback: scan all links for job-like patterns
-        if (results.length === 0) {
-          document.querySelectorAll('a[href]').forEach(a => {
-            const href = (a as HTMLAnchorElement).href;
-            const text = (a.textContent ?? '').trim();
-            if ((href.includes('/job/') || href.includes('/position/')) && text.length > 10 && text.length < 150) {
-              results.push({ title: text.split('\n')[0].trim(), url: href, location: 'Canada' });
             }
           });
         }
